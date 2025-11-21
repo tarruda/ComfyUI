@@ -685,7 +685,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         else:
             vram_set_state = vram_state
         lowvram_model_memory = 0
-        if lowvram_available and (vram_set_state == VRAMState.LOW_VRAM or vram_set_state == VRAMState.NORMAL_VRAM) and not force_full_load:
+        if lowvram_available and (vram_set_state == VRAMState.LOW_VRAM or vram_set_state == VRAMState.NORMAL_VRAM or vram_set_state == VRAMState.SHARED) and not force_full_load:
             loaded_memory = loaded_model.model_loaded_memory()
             current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
@@ -697,6 +697,10 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
         if vram_set_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
+
+        if lowvram_model_memory == 0:
+            # Avoid the 1e32 sentinel path so MPS/shared memory gets a realistic budget even when full load is requested.
+            lowvram_model_memory = loaded_model.model_memory() + 128 * 1024 * 1024
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
         current_loaded_models.insert(0, loaded_model)
@@ -1235,8 +1239,19 @@ def get_free_memory(dev=None, torch_free_too=False):
         dev = get_torch_device()
 
     if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
-        mem_free_total = psutil.virtual_memory().available
-        mem_free_torch = mem_free_total
+        # On MPS, torch retains allocations in the driver; subtract what torch already holds.
+        vm = psutil.virtual_memory()
+        if dev.type == 'mps':
+            mps_reserved = 0
+            try:
+                mps_reserved = torch.mps.driver_allocated_memory()
+            except Exception:
+                pass
+            mem_free_total = max(0, min(vm.available, vm.total - mps_reserved))
+            mem_free_torch = max(0, vm.available - mps_reserved)
+        else:
+            mem_free_total = vm.available
+            mem_free_torch = mem_free_total
     else:
         if directml_enabled:
             mem_free_total = 1024 * 1024 * 1024 #TODO
